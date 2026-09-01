@@ -105,6 +105,14 @@ public enum FeedKernels {
         guard dimension >= 1, buffer.count > 0 else { return }
         var start = 0
         while start < buffer.count {
+            // `start + dimension` is the one addition in this file that does not
+            // go through `Saturating`, and the reason is worth writing down
+            // rather than leaving as an apparent inconsistency: `start` only
+            // advances by `width`, which is at most `buffer.count - start`, so
+            // `start < buffer.count` on every iteration. A `dimension` large
+            // enough to overflow ends the loop on the first pass with
+            // `start == 0`. The addition is therefore bounded by
+            // `buffer.count + dimension`, and `buffer` is a real allocation.
             let end = min(start + dimension, buffer.count)
             let width = end - start
             var sum = 0
