@@ -36,13 +36,15 @@ final class NegativeControlTests: XCTestCase {
 
         let owningLedger = AllocationLedger()
         let owning = try OwningPipeline.run(configuration: configuration, ledger: owningLedger)
+        let consumingLedger = AllocationLedger()
+        let consuming = try ConsumingValuePipeline.run(configuration: configuration, ledger: consumingLedger)
 
         // Correct value stages first: this must agree, or the negative control
         // below proves nothing.
         let goodLedger = AllocationLedger()
         let good = try ValuePipeline.run(configuration: configuration, ledger: goodLedger)
         XCTAssertTrue(
-            BoundaryComparison(configuration: configuration, owning: owning, value: good).outputsMatch,
+            BoundaryComparison(configuration: configuration, owning: owning, consumingValue: consuming, value: good).outputsMatch,
             "baseline must match before the broken variant means anything"
         )
 
@@ -57,7 +59,7 @@ final class NegativeControlTests: XCTestCase {
             configuration: configuration, ledger: brokenLedger, stages: brokenStages
         )
         let brokenComparison = BoundaryComparison(
-            configuration: configuration, owning: owning, value: broken
+            configuration: configuration, owning: owning, consumingValue: consuming, value: broken
         )
 
         XCTAssertFalse(

@@ -39,9 +39,15 @@ public final class FramePool: @unchecked Sendable {
     private var totalReuses: Int = 0
 
     /// - Parameters:
-    ///   - bufferCapacity: Byte size of every vended buffer. Values below one
-    ///     are raised to one so that `allocate(byteCount:)` always receives a
-    ///     positive count.
+    ///   - bufferCapacity: Byte size of every vended buffer. Clamped to
+    ///     `1 ... Saturating.maximumElementCount`.
+    ///
+    ///     The upper clamp matters and is not decoration: `allocate` aborts the
+    ///     process on failure and that abort is not catchable, so a public
+    ///     initializer that accepted an arbitrary `Int` would turn a plain
+    ///     argument into a crash. `FeedGeometry` enforces the same ceiling, but
+    ///     a caller can construct a pool without ever going through it — so the
+    ///     bound has to live at the site that actually allocates.
     ///   - retentionLimit: Free-list size. Clamped to at least zero.
     ///   - liveLimit: Optional checkout ceiling for backpressure.
     ///   - ledger: The instrument that records this pool's allocations.
@@ -51,7 +57,7 @@ public final class FramePool: @unchecked Sendable {
         liveLimit: Int? = nil,
         ledger: AllocationLedger
     ) {
-        self.bufferCapacity = max(1, bufferCapacity)
+        self.bufferCapacity = min(max(1, bufferCapacity), Saturating.maximumElementCount)
         self.retentionLimit = max(0, retentionLimit)
         self.liveLimit = liveLimit.map { max(1, $0) }
         self.ledger = ledger

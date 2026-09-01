@@ -100,10 +100,9 @@ final class SaturatingTests: XCTestCase {
         // where `Int` is 32 bits) and a 256 MiB allocation bound (because
         // `allocate` aborts uncatchably rather than throwing). The smaller wins.
         //
-        // Both halves are asserted, not just the answer: a change to either
-        // bound turns this red, which a bare `> 0` check would not.
+        // One assertion, and it is a change-detector: altering either bound
+        // turns it red. The two "is it below each bound" checks that used to
+        // follow were implied by this line and asserted nothing extra.
         XCTAssertEqual(Saturating.maximumElementCount, min(Int.max / 4, 256 * 1024 * 1024))
-        XCTAssertLessThanOrEqual(Saturating.maximumElementCount, Int.max / 4)
-        XCTAssertLessThanOrEqual(Saturating.maximumElementCount, 256 * 1024 * 1024)
     }
 }

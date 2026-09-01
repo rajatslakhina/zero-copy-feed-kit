@@ -1,21 +1,19 @@
 # ZeroCopyFeed
 
-**Whether your on-device inference feed copies every frame is decided by the shape of a function signature — not by the algorithm inside it.** This package makes that decision measurable: the same quantized embedding tiles, the same kernels, run through two module boundaries, with an allocation ledger counting what each one actually cost.
+**Whether your on-device inference feed copies every frame is decided by one keyword in a function signature.** Not by the algorithm inside it, and — this is the part that surprised me — not by whether the signature is erasable either.
 
-The result, from the test suite, not from prose:
+This package makes that decision measurable: the same quantized embedding tiles, the same kernels, run through **three** module boundaries, with an allocation ledger counting what each one cost.
 
-| 20 frames · 6 stages · 2 KB/frame | Owning boundary | Value boundary |
-|---|---:|---:|
-| Heap allocations | **2** | **120** |
-| Bytes allocated | 4,096 | 184,320 |
-| Buffer reuses | 38 | 0 |
-| Peak live bytes | 4,096 | 4,096 |
-| Boundary copies | 20 (40,960 B) | 0 |
-| Output digest | *identical* | *identical* |
+| 20 frames · 6 stages · 2 KB/frame | `inout FrameStore` | `consuming FrameValue` | `borrowing FrameValue` |
+|---|---:|---:|---:|
+| Heap allocations | **2** | **20** | **120** |
+| Bytes allocated | 4,096 | 20,480 | 184,320 |
+| Peak live bytes | 4,096 | 1,024 | 4,096 |
+| Output digest | *identical* | *identical* | *identical* |
 
-Two allocations, not forty, not one hundred and twenty — and **the number does not change when you process 200 frames instead of 20.**
+Two allocations, not twenty, not one hundred and twenty — and **only the first column stays at 2 when you process 200 frames instead of 20.**
 
-Two things this table is *not* claiming, stated up front rather than in a footnote. It excludes the per-frame synthetic capture buffer, which both paths allocate identically (one `[Int8]` per frame, 20 each here) — symmetric, so it cancels, but it means the absolute totals are ~22 vs ~140 rather than 2 vs 120. And nothing here runs a model: the payload is deterministic SplitMix64 noise and the kernels are integer requantize / mean-removal / gate / fold. This is the *plumbing* an on-device inference feed needs, sized and shaped like the real thing, not an inference engine.
+Two things this table is *not* claiming. It excludes the per-frame synthetic capture buffer, which every path allocates identically (one `[Int8]` per frame) — symmetric, so it cancels, but the absolute totals are ~22 / ~40 / ~140 rather than 2 / 20 / 120. And nothing here runs a model: the payload is deterministic SplitMix64 noise and the kernels are integer requantize / mean-removal / gate / fold. This is the *plumbing* an on-device inference feed needs, sized and shaped like the real thing, not an inference engine.
 
 ---
 
@@ -23,27 +21,42 @@ Two things this table is *not* claiming, stated up front rather than in a footno
 
 Every discussion of `borrow`, `consuming`, `~Copyable` and spans gets filed under *micro-optimization*, argued about at the level of a single loop, and then dropped because "we should profile first."
 
-That framing is wrong, and it is wrong in a way that costs real money on a real feed path. Consider the two signatures a team actually chooses between when someone writes the tile-processing module:
+That framing is wrong, and it is wrong in a way that costs real money on a real feed path. Consider the signatures a team actually chooses between when someone writes the tile-processing module:
 
 ```swift
-// A
+// A — the one you get if you don't think about ownership
 func transform(_ input: FrameValue) -> FrameValue
 
-// B
-func apply(to frame: inout FrameStore)   // FrameStore is ~Copyable
+// B — one keyword different
+func transform(_ input: consuming FrameValue) -> FrameValue
+
+// C — noncopyable, pool-backed
+func apply(to frame: inout FrameStore)
 ```
 
-Signature **A** is obliged to allocate. Not "might allocate under some conditions" — *obliged*, structurally, because it returns a value and its input is still alive at the point of mutation, so copy-on-write fires every single time. One allocation per stage per frame. On a six-stage pipeline at 30 fps that is 180 allocations a second whose only purpose is to satisfy the shape of a type signature.
+**A** is structurally obliged to allocate — not "might allocate under some conditions", *obliged*, because the caller still owns `input` at the point of mutation, so copy-on-write fires every single time. One allocation per stage per frame. On a six-stage pipeline at 30 fps that is 180 allocations a second whose only purpose is to satisfy an ownership rule nobody thought about.
 
-Signature **B** cannot allocate, because it was handed the caller's storage.
+**B** is the same signature — still value-in/value-out, still `Sendable`, still erases into `[any ConsumingValueFeedStage]`, still injectable and mockable — and it allocates **nothing at all** for an in-place stage, because `consuming` ends the caller's ownership at the call and the storage is uniquely referenced.
 
-Neither of these is a loop-level decision. Both are **module boundary** decisions, made once, in a design review, and then inherited by every call site for the lifetime of the module. By the time anyone opens Instruments, the choice is a hundred files deep. That is why this belongs in an architecture conversation and not a performance one.
+**C** cannot allocate, because it was handed the caller's storage.
 
-And the trade runs in both directions, which is the part usually left out:
+### The claim I had to retract
 
-> **You can have erased, composable, dependency-injected stages, or you can have zero copies. Choosing one costs you the other.**
+An earlier version of this README compared only **A** against **C** and concluded:
 
-`FrameStore` is `~Copyable`, so a protocol requirement taking it cannot be boxed into `[any FeedStage]`. The owning pipeline in this package therefore dispatches over a *closed enum* — no third-party extension point, no injection, no mocking a stage in a test. The value pipeline gets all of that for free and pays 60× the allocations for it. This package prices the trade instead of asserting a winner.
+> ~~You can have erased, composable, dependency-injected stages, or you can have zero copies. Choosing one costs you the other.~~
+
+That is false, and `ConsumingValueBoundary.swift` is the counter-example, shipped in the package so the mistake cannot come back. Erasure is not what costs you the copies. The *ownership annotation on the parameter* is. Measured, with no size-changing stage in the pipeline, the erased consuming boundary allocates **zero** times.
+
+### What survives
+
+The durable claim is about **shape**, not magnitude:
+
+> **Only the owning boundary's allocation count is constant in frame count. Every value boundary is linear in it** — because a size-changing stage must produce new storage, and a value type has nowhere to recycle it to.
+
+1 / 20 / 200 frames give the owning path 2 allocations every time. They give the consuming path 1 / 20 / 200, and the borrowing path 6 / 120 / 1200. That is the difference a pool buys, and it is the only difference a pool buys.
+
+So the honest ratio depends entirely on what you are comparing against: **60×** against the signature most people write by accident, **10×** against the best one a careful engineer would write. Both are in the table. Leading with only the first would be an advertisement.
 
 ---
 
@@ -54,22 +67,27 @@ And the trade runs in both directions, which is the part usually left out:
 | `FrameStore` | `~Copyable` frame over pool-owned raw memory. Scoped `withBytes` / `withMutableInt8` borrows; `deinit` returns the buffer. |
 | `FramePool` | Fixed-capacity recycler with a free list, a retention limit, an optional live limit for backpressure, and its own counters. |
 | `AllocationLedger` | The instrument. Counts allocations, deallocations, reuses, boundary copies, live and peak bytes — all saturating. |
-| `FeedKernels` | The arithmetic: integer requantise, per-tile mean removal, magnitude gating, pairwise tile fold. Called identically by both boundaries. |
-| `OwningPipeline` | Boundary **B**. `inout FrameStore`, enum-dispatched, ping-pongs through the pool for the size-changing stage. |
-| `ValuePipeline` / `ValueFeedStage` | Boundary **A**. `FrameValue -> FrameValue`, `any`-erased, injectable. |
+| `FeedKernels` | The arithmetic: integer requantise, per-tile mean removal, magnitude gating, pairwise tile fold. Called identically by all three boundaries. |
+| `OwningPipeline` | Boundary **C**. `inout FrameStore`, enum-dispatched, ping-pongs through the pool for the size-changing stage. |
+| `ConsumingValuePipeline` / `ConsumingValueFeedStage` | Boundary **B**. `consuming FrameValue -> FrameValue`, `any`-erased, injectable, and allocation-free for in-place stages. |
+| `ValuePipeline` / `ValueFeedStage` | Boundary **A**. `borrowing FrameValue -> FrameValue`, `any`-erased, injectable, copy-on-write at every stage. |
 | `TileWalk` | Batched borrowing — the `Iterable`/span idea at tile granularity, pinned against an element-at-a-time reference. |
 | `Saturating` | Total arithmetic. Every trapping operation on the feed path routes through here. |
-| `BoundaryBenchmark` | Runs both, returns a `BoundaryComparison` with an `outputsMatch` gate. |
+| `BoundaryBenchmark` | Runs all three, returns a `BoundaryComparison` with an `outputsMatch` gate. |
 
 ### The load-bearing design decisions
 
 **Ownership is enforced by the compiler, not by a code-review rule.** `FrameStore` is noncopyable, so you cannot double-return a buffer (you cannot name the same allocation twice), cannot forget to return one (`deinit` runs at last use), and cannot alias one across a stage boundary. The size-changing stage is written as `frame = consume destination` — moving the new frame in destroys the old one, whose `deinit` hands its buffer back. Ping-pong with no bookkeeping and no possible leak.
 
-**The comparison is gated on output equality.** A path that skips work allocates less for uninteresting reasons. `BoundaryComparison.outputsMatch` compares an FNV-1a/64 digest of every frame's final bytes from both paths; if they diverge, `headline` refuses to print a ratio at all. `NegativeControlTests` runs a value stage with one threshold changed and asserts the check *fails* — a check that only ever passes is decoration.
+**The comparison is gated on output equality.** A path that skips work allocates less for uninteresting reasons. `BoundaryComparison.outputsMatch` compares an FNV-1a/64 digest of every frame's final bytes across all three paths; if any diverges, `headline` refuses to print a ratio at all. `ConsumingValueBoundaryTests` also asserts the stronger property — the three paths agree **byte for byte** — outside the measured region, so "identical output" does not rest on a hash alone. `NegativeControlTests` runs a value stage with one threshold changed and asserts the check *fails* — a check that only ever passes is decoration.
 
 **FNV-1a, deliberately not `Hasher`.** `Hasher` is seeded per process, so a digest taken from it is not comparable across launches — and a single-process test suite structurally cannot catch that, because both sides of the comparison share the seed. The digests here are constants; the tests hardcode them.
 
 **Two independent counters.** The pool counts allocations because it makes them; the ledger counts them because it was told to. `testPoolCountersAgreeWithTheLedger` asserts they match across every stage count, so the harness cannot quietly report its own assumptions.
+
+### Considered and shipped instead of rejected
+
+- **`consuming FrameValue` for the value boundary.** This was the missing alternative, and leaving it out was the single biggest flaw in the first version of this package. It is not rejected — it is shipped as a first-class third pipeline, because it is what a careful engineer writes and it is what the argument has to beat. Measured: 20 allocations at the headline configuration versus 120 for the borrowing form, and **0** when no stage changes size.
 
 ### Rejected alternatives
 
@@ -77,7 +95,7 @@ And the trade runs in both directions, which is the part usually left out:
 - **`Mutex` from `Synchronization`.** The better primitive, but gated behind iOS 18 / macOS 15. The package declares `.iOS(.v16)`, so `NSLock` it is.
 - **`Foundation.Data` for the value path.** Its allocations happen inside Foundation where the ledger cannot see them. `FrameValue` wraps `[Int8]`, whose copy-on-write behaviour is observable and attributable — and *is* a real allocation, not a rigged number.
 - **Floating-point kernels.** Rejected: outputs would then be comparable only "up to a tolerance", and *up to a tolerance* is not a property this package wants to claim. Everything is exact integer arithmetic.
-- **Live recompute on slider drag in the demo.** Rejected: a 200-frame run is real work and `onChange` would start one per rendered frame.
+- **Live recompute on slider drag in the demo.** Rejected: a 200-frame run is real work and `onChange` would start one per rendered frame. The run is also moved off the main actor with cancellation, so dragging a slider cannot freeze the UI — a screen arguing about the cost of avoidable work should not be doing avoidable work on the main thread.
 
 ---
 
@@ -116,7 +134,7 @@ There are exactly three force-unwrap-shaped constructs in the package — `Frame
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/rajatslakhina/zero-copy-feed-kit.git", from: "1.0.0")
+.package(url: "https://github.com/rajatslakhina/zero-copy-feed-kit.git", from: "1.1.0")
 ```
 
 ```swift
@@ -126,7 +144,7 @@ There are exactly three force-unwrap-shaped constructs in the package — `Frame
 ])
 ```
 
-In Xcode: **File → Add Package Dependencies…**, paste the URL, choose *Up to Next Major Version* from `1.0.0`.
+In Xcode: **File → Add Package Dependencies…**, paste the URL, choose *Up to Next Major Version* from `1.1.0`.
 
 ## Running it yourself
 
@@ -145,11 +163,12 @@ import ZeroCopyFeed
 let comparison = try BoundaryBenchmark.compare(
     tileCount: 32, dimension: 64, frameCount: 20, stageCount: 6
 )
-print(comparison.outputsMatch)                      // true
-print(comparison.owning.stats.allocationCount)      // 2
-print(comparison.value.stats.allocationCount)       // 120
+print(comparison.outputsMatch)                              // true
+print(comparison.owning.stats.allocationCount)              // 2
+print(comparison.consumingValue.stats.allocationCount)      // 20
+print(comparison.value.stats.allocationCount)               // 120
 print(comparison.headline)
-// 20 frames · 6 stages · 2 vs 120 allocations (60.0×)
+// 20 frames · 6 stages · 2 / 20 / 120 allocations (owning / consuming / borrowing)
 ```
 
 `ZeroCopyFeedUI` compiles to nothing where SwiftUI is unavailable, so the package builds and tests cleanly on Linux.
@@ -158,8 +177,8 @@ print(comparison.headline)
 
 ## Verification
 
-- **72 tests, 0 failures** on Swift 6.0.3 (Linux, aarch64), from a clean `rm -rf .build` followed by `swift build -Xswiftc -warnings-as-errors` and `swift test`.
-- CI runs two jobs on every push — a Linux job that repeats that clean warnings-as-errors build and the full test run, and a `macos-15` job that compiles the package for `generic/platform=iOS Simulator`. Status is on the [Actions tab](../../actions).
+- **79 tests, 0 failures** on Swift 6.0.3 (Linux, aarch64), from a clean `rm -rf .build` followed by `swift build -Xswiftc -warnings-as-errors` and `swift test`.
+- CI runs two jobs on every push to `main` (and on pull requests into it) — a Linux job that repeats that clean warnings-as-errors build and the full test run, and a `macos-15` job that compiles the package for `generic/platform=iOS Simulator`. Status is on the [Actions tab](../../actions).
 - Scope of the warnings claim, precisely: `-warnings-as-errors` is applied by the Linux job, which compiles the core module. `ZeroCopyFeedUI` is entirely inside `#if canImport(SwiftUI)` and so is only *compiled* by the macOS job, which does not pass the flag — deliberately, because supporting iOS 16 means using APIs (`foregroundColor`) that are soft-deprecated on the iOS 17+ SDK. So "zero warnings, machine-enforced" is true of the core module and is not claimed of the SwiftUI layer.
 - **A Simulator run was attempted and could not be performed** — see the demo repo's README for the verbatim refusal and what was verified instead. "It compiles for a Simulator" and "it ran on a Simulator" are different claims and are reported separately.
 

@@ -160,18 +160,31 @@ final class KernelTests: XCTestCase {
     }
 
     func testFoldPairsSurvivesAnAbsurdGeometry() {
-        // `(tileCount + 1) / 2` overflows at `Int.max`, and the per-tile offsets
-        // `tile * dimension` overflow well before that. All of these used to
-        // trap; the destination's length is now the real bound on the work.
+        // `(tileCount + 1) / 2` overflows at `Int.max` — that is the trap this
+        // guards, and it is the only one still reachable: the destination-length
+        // `break` means the per-tile offsets are compared against a real buffer
+        // length before they can grow, so `Saturating` on those is defensive
+        // rather than load-bearing. Said precisely because claiming to have
+        // fixed a bug that cannot happen is its own kind of dishonesty.
+        //
+        // Contents are asserted, not just `written` — an implementation that
+        // scribbled a constant everywhere would satisfy a count-only check.
         let (a, writtenA) = folding([1, 2, 3, 4], tileCount: Int.max, dimension: 1, destinationCount: 2)
         XCTAssertEqual(writtenA, 2)
-        XCTAssertEqual(a.count, 2)
+        // dimension 1: tiles are single elements, so output[i] = avg(in[2i], in[2i+1]).
+        // avg(1,2) rounds away from zero to 2; avg(3,4) to 4.
+        XCTAssertEqual(a, [2, 4])
 
-        let (_, writtenB) = folding([1, 2, 3, 4], tileCount: 2, dimension: Int.max, destinationCount: 2)
+        let (b, writtenB) = folding([1, 2, 3, 4], tileCount: 2, dimension: Int.max, destinationCount: 2)
         XCTAssertEqual(writtenB, 2, "an absurd dimension truncates to the destination rather than spinning")
+        // One output tile, clipped to the 2-element destination: components 0
+        // and 1 of avg(tile0, tile1). With dimension = Int.max the second tile
+        // starts past the end of the source, so those components pass through.
+        XCTAssertEqual(b, [1, 2])
 
-        let (_, writtenC) = folding([1, 2], tileCount: Int.max, dimension: Int.max, destinationCount: 1)
+        let (c, writtenC) = folding([1, 2], tileCount: Int.max, dimension: Int.max, destinationCount: 1)
         XCTAssertEqual(writtenC, 1)
+        XCTAssertEqual(c, [1])
     }
 
     func testFoldPairsZeroesRatherThanLeavingStaleBytes() {

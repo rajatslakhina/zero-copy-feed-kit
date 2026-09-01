@@ -46,8 +46,12 @@ public enum TileWalk {
         var start = 0
         var tileIndex = 0
         while start < buffer.count {
-            // `start + dimension` overflows for a `dimension` near `Int.max`,
-            // which the `>= 1` guard does not exclude.
+            // Belt-and-braces, and worth being precise about: `start + dimension`
+            // is *not* reachable overflow. `start` only advances to a value
+            // strictly less than `buffer.count`, so a `dimension` large enough
+            // to overflow also ends the loop on the first iteration, where
+            // `start` is 0. `Saturating.add` is here so the bound does not
+            // depend on that argument staying true if the loop is ever changed.
             let end = min(Saturating.add(start, dimension), buffer.count)
             // `baseAddress` is non-nil because `buffer.count > 0` was checked
             // above; the `if let` is here so a debug build of an empty buffer
@@ -72,10 +76,12 @@ public enum TileWalk {
         var start = 0
         var tileIndex = 0
         while start < buffer.count {
+            // Same defensive-not-load-bearing `Saturating.add` as
+            // `forEachTile(in:dimension:_:)` — see the note there.
             let end = min(Saturating.add(start, dimension), buffer.count)
-            // Same reasoning as `forEachTile(in:dimension:_:)`: `baseAddress` is
-            // non-nil because `buffer.count > 0` was checked above, and the
-            // `if let` keeps an empty buffer a no-op rather than a trap.
+            // `baseAddress` is non-nil because `buffer.count > 0` was checked
+            // above, and the `if let` keeps an empty buffer a no-op rather than
+            // a trap.
             if let base = buffer.baseAddress {
                 let tile = UnsafeMutableBufferPointer(start: base + start, count: end - start)
                 try body(tileIndex, tile)

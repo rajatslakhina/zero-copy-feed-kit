@@ -1,16 +1,31 @@
 import Foundation
 
-/// Which side of the boundary decision a run represents.
+/// Which of the three boundary shapes a run represents.
 public enum BoundaryShape: String, Sendable, Codable, CaseIterable {
     /// `inout FrameStore` — noncopyable, pool-backed, statically dispatched.
     case owning
-    /// `FrameValue -> FrameValue` — copyable, erasable, allocation per stage.
+    /// `consuming FrameValue -> FrameValue` — copyable and erasable, but
+    /// ownership ends at the call, so in-place stages do not copy.
+    case consumingValue
+    /// `borrowing FrameValue -> FrameValue` — the default value signature.
+    /// Copy-on-write fires at every stage because the input outlives the call.
     case value
 
     public var displayName: String {
         switch self {
-        case .owning: return "Owning boundary"
-        case .value:  return "Value boundary"
+        case .owning:         return "Owning boundary"
+        case .consumingValue: return "Consuming value"
+        case .value:          return "Borrowing value"
+        }
+    }
+
+    /// The parameter annotation that defines this shape — the whole difference
+    /// between the two value rows is this one keyword.
+    public var signature: String {
+        switch self {
+        case .owning:         return "inout FrameStore"
+        case .consumingValue: return "consuming FrameValue"
+        case .value:          return "borrowing FrameValue"
         }
     }
 }
@@ -101,16 +116,34 @@ public struct BoundaryComparison: Sendable, Equatable {
 
     public let configuration: FeedRunConfiguration
     public let owning: BoundaryRunResult
+
+    /// The **strongest** value-boundary design: same erased, injectable
+    /// signature, but `consuming` instead of `borrowing`. Included because a
+    /// comparison against only ``value`` is a comparison against a strawman.
+    public let consumingValue: BoundaryRunResult
+
+    /// The *default* value-boundary design — what you get from
+    /// `func transform(_ input: FrameValue) -> FrameValue` without thinking
+    /// about ownership.
     public let value: BoundaryRunResult
 
-    public init(configuration: FeedRunConfiguration, owning: BoundaryRunResult, value: BoundaryRunResult) {
+    public init(
+        configuration: FeedRunConfiguration,
+        owning: BoundaryRunResult,
+        consumingValue: BoundaryRunResult,
+        value: BoundaryRunResult
+    ) {
         self.configuration = configuration
         self.owning = owning
+        self.consumingValue = consumingValue
         self.value = value
     }
 
-    /// True when both boundaries produced the same output **digest** for every
-    /// frame, over the same geometry and the same frame count.
+    /// All three runs, in table order.
+    public var allResults: [BoundaryRunResult] { [owning, consumingValue, value] }
+
+    /// True when all three boundaries produced the same output **digest** for
+    /// every frame, over the same geometry and the same frame count.
     ///
     /// Stated as "digest" rather than "byte-identical" because that is what was
     /// compared: a 64-bit FNV-1a fold, chosen so neither path has to materialise
@@ -122,59 +155,80 @@ public struct BoundaryComparison: Sendable, Equatable {
     /// are meaningless, because a path that skips work allocates less for
     /// uninteresting reasons.
     public var outputsMatch: Bool {
-        owning.combinedDigest == value.combinedDigest
-            && owning.finalGeometry == value.finalGeometry
-            && owning.framesProcessed == value.framesProcessed
+        allResults.allSatisfy {
+            $0.combinedDigest == owning.combinedDigest
+                && $0.finalGeometry == owning.finalGeometry
+                && $0.framesProcessed == owning.framesProcessed
+        }
     }
 
-    /// How many times more heap allocations the value boundary made.
-    /// Returns `nil` rather than dividing by zero when the owning path made
-    /// none — which happens for a zero-stage configuration.
-    public var allocationRatio: Double? {
+    /// How many times more heap allocations the **default** (borrowing) value
+    /// boundary made. `nil` rather than a division by zero when the owning path
+    /// made none — which happens for a zero-stage configuration.
+    public var allocationRatio: Double? { ratio(of: value) }
+
+    /// How many times more heap allocations the **consuming** value boundary
+    /// made. This is the honest comparison: it is what you get from someone who
+    /// reached for `consuming`, and it is the number the argument has to
+    /// survive.
+    public var consumingAllocationRatio: Double? { ratio(of: consumingValue) }
+
+    private func ratio(of result: BoundaryRunResult) -> Double? {
         let denominator = owning.stats.allocationCount
         guard denominator > 0 else { return nil }
-        return Double(value.stats.allocationCount) / Double(denominator)
+        return Double(result.stats.allocationCount) / Double(denominator)
     }
 
-    /// Allocations the owning boundary avoided.
+    /// Allocations the owning boundary avoided versus the default value shape.
     public var allocationsAvoided: Int {
         max(0, value.stats.allocationCount - owning.stats.allocationCount)
     }
 
-    /// Payload bytes the owning boundary never had to write to fresh memory.
+    /// Payload bytes the owning boundary never had to write to fresh memory,
+    /// versus the default value shape.
     public var bytesAvoided: Int {
         max(0, value.stats.bytesAllocated - owning.stats.bytesAllocated)
     }
 
     /// A one-line summary suitable for a log or a UI caption.
+    ///
+    /// Reports all three, because reporting only the extremes is how a
+    /// benchmark quietly becomes an advertisement.
     public var headline: String {
         guard outputsMatch else {
             return "Outputs diverged — the comparison is not valid."
         }
-        let ratioText = allocationRatio.map { String(format: "%.1f×", $0) } ?? "n/a"
         return "\(configuration.frameCount) frames · \(configuration.stages.count) stages · "
-            + "\(owning.stats.allocationCount) vs \(value.stats.allocationCount) allocations (\(ratioText))"
+            + "\(owning.stats.allocationCount) / \(consumingValue.stats.allocationCount) / "
+            + "\(value.stats.allocationCount) allocations (owning / consuming / borrowing)"
     }
 }
 
-/// Runs the same feed through both boundaries and reports the difference.
+/// Runs the same feed through all three boundaries and reports the difference.
 public enum BoundaryBenchmark {
 
-    /// Each shape gets its own ledger so neither can contaminate the other's
+    /// Each shape gets its own ledger so none can contaminate another's
     /// counters; the *configuration* and the kernels are shared, which is what
     /// makes the comparison fair.
     ///
-    /// - Throws: any ``FeedError`` raised by either pipeline — notably
+    /// - Throws: any ``FeedError`` raised by any pipeline — notably
     ///   ``FeedError/poolExhausted(live:limit:)`` when the configured live limit
     ///   is too small for a pipeline containing `foldPairs`.
     public static func compare(configuration: FeedRunConfiguration) throws -> BoundaryComparison {
         let owningLedger = AllocationLedger()
+        let consumingLedger = AllocationLedger()
         let valueLedger = AllocationLedger()
 
         let owning = try OwningPipeline.run(configuration: configuration, ledger: owningLedger)
+        let consuming = try ConsumingValuePipeline.run(configuration: configuration, ledger: consumingLedger)
         let value = try ValuePipeline.run(configuration: configuration, ledger: valueLedger)
 
-        return BoundaryComparison(configuration: configuration, owning: owning, value: value)
+        return BoundaryComparison(
+            configuration: configuration,
+            owning: owning,
+            consumingValue: consuming,
+            value: value
+        )
     }
 
     /// Convenience for callers holding raw slider values.

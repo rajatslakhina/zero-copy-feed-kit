@@ -204,6 +204,9 @@ final class BoundaryComparisonTests: XCTestCase {
         let comparison = try BoundaryBenchmark.compare(
             tileCount: 32, dimension: 64, frameCount: 20, stageCount: 6
         )
-        XCTAssertEqual(comparison.headline, "20 frames · 6 stages · 2 vs 120 allocations (60.0×)")
+        XCTAssertEqual(
+            comparison.headline,
+            "20 frames · 6 stages · 2 / 20 / 120 allocations (owning / consuming / borrowing)"
+        )
     }
 }

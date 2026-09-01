@@ -36,8 +36,13 @@ final class FramePoolTests: XCTestCase {
         XCTAssertEqual(pool.allocationCount, ledger.stats.allocationCount,
                        "pool and ledger disagree after contention")
         XCTAssertEqual(pool.reuseCount, ledger.stats.reuseCount)
-        XCTAssertLessThanOrEqual(pool.allocationCount, threads,
-                                 "contention should not allocate more than one buffer per thread")
+        // Deliberately NOT asserting `allocationCount <= threads`. With a
+        // retention limit of 4 and 8 workers, a release that finds the free list
+        // full deallocates, and a later acquire then has to allocate again — so
+        // the cumulative count is a function of core count, not an invariant.
+        // An assertion that passes on a 4-core box and fails on a 16-core one is
+        // worse than no assertion.
+        XCTAssertGreaterThanOrEqual(pool.allocationCount, 1)
         pool.drain()
         XCTAssertTrue(ledger.stats.isBalanced, "concurrent run leaked")
     }
@@ -140,6 +145,20 @@ final class FramePoolTests: XCTestCase {
         XCTAssertEqual(negative.bufferCapacity, 1)
         XCTAssertEqual(negative.retentionLimit, 0)
         XCTAssertEqual(negative.liveLimit, 1, "a live limit of zero would make the pool unusable")
+    }
+
+    func testHugeCapacityIsClampedRatherThanAborting() throws {
+        // `FramePool.init` is public and `allocate` aborts uncatchably on
+        // failure, so an unclamped `Int.max` here would turn a plain argument
+        // into a process crash — the exact failure the geometry ceiling exists
+        // to prevent, at the one site that actually allocates.
+        let ledger = AllocationLedger()
+        let pool = FramePool(bufferCapacity: Int.max, retentionLimit: 0, ledger: ledger)
+        XCTAssertEqual(pool.bufferCapacity, Saturating.maximumElementCount)
+        // And it must still be usable, not merely non-crashing on init.
+        let smaller = FramePool(bufferCapacity: 1 << 20, retentionLimit: 1, ledger: ledger)
+        let frame = try smaller.acquire()
+        XCTAssertEqual(frame.capacity, 1 << 20)
     }
 
     func testDrainIsIdempotent() throws {
