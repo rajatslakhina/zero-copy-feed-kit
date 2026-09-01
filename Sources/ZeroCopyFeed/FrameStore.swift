@@ -19,15 +19,22 @@ import Foundation
 ///
 /// ## Relationship to SE-0507
 ///
-/// Swift 6.4 adds `borrow` and `mutate` accessors, which express "hand out a
-/// view of the storage, do not copy it" as a property rather than as a closure,
-/// and without the allocation-plus-two-calls overhead of a `_read`/`_modify`
-/// coroutine. This package targets Swift 6.0, so the same semantics are spelled
-/// with scoped closures — ``withBytes(_:)`` and ``withMutableBytes(_:)``. The
-/// borrowing *contract* is identical: the closure sees the storage in place and
-/// the buffer pointer must not escape it. What 6.4 changes is the ergonomics and
-/// the call overhead, not which boundary shapes preserve zero copies — which is
-/// exactly why this library's argument survives the version gap.
+/// Swift 6.4 implements `borrow` and `mutate` accessors, which express "hand out
+/// a view of the storage, do not copy it" as a property rather than as a
+/// closure, and without the allocation-plus-two-calls overhead of a
+/// `_read`/`_modify` coroutine. This package targets Swift 6.0, so the same
+/// semantics are spelled with scoped closures — ``withBytes(_:)`` and
+/// ``withMutableInt8(_:)``. The borrowing *contract* is identical: the closure
+/// sees the storage in place and the buffer pointer must not escape it.
+///
+/// One caveat worth stating rather than glossing: `FrameStore`'s storage is a
+/// raw pointer, and SE-0507 lists *borrowing via unsafe pointers* under future
+/// directions — a `borrow` accessor may only return a stored property, or a
+/// computed one that itself has a `borrow` accessor. So this type is precisely
+/// the case the proposal defers, and adopting 6.4 here is not a mechanical
+/// find-and-replace. What 6.4 changes is ergonomics and call overhead; what it
+/// does not change is which boundary shapes preserve zero copies — which is why
+/// this library's argument survives the version gap regardless.
 public struct FrameStore: ~Copyable {
 
     @usableFromInline internal let base: UnsafeMutableRawPointer

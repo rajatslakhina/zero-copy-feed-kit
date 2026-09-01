@@ -93,10 +93,15 @@ public enum Saturating {
 
     /// The largest element count the feed path will accept.
     ///
-    /// Derived from `Int.max` rather than written as a literal so it shrinks
-    /// automatically on 32-bit platforms. A frame this large is already far
-    /// beyond anything an on-device feed would hold; the ceiling exists so that
-    /// geometry validation has a defined answer instead of relying on
-    /// multiplication not overflowing.
-    public static let maximumElementCount: Int = Int.max / 4
+    /// Two bounds, and the smaller wins:
+    ///
+    /// - `Int.max / 4` is the *overflow* bound. Deriving it from `Int.max`
+    ///   rather than writing a 64-bit literal is what keeps it correct where
+    ///   `Int` is 32 bits (watchOS).
+    /// - 256 MiB is the *allocation* bound. `UnsafeMutableRawPointer.allocate`
+    ///   aborts the process on failure and that abort is not catchable, so a
+    ///   geometry validator that only checked for overflow would happily accept
+    ///   a frame no device can allocate and turn a throwable error into a crash.
+    ///   A single on-device feed frame is kilobytes; 256 MiB is already absurd.
+    public static let maximumElementCount: Int = min(Int.max / 4, 256 * 1024 * 1024)
 }

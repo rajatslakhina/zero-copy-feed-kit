@@ -1,7 +1,46 @@
+import Dispatch
 import XCTest
 @testable import ZeroCopyFeed
 
 final class FramePoolTests: XCTestCase {
+
+    // MARK: - Concurrency
+
+    func testPoolAndLedgerStayConsistentUnderConcurrentWriters() {
+        // `FramePool` and `AllocationLedger` are both `@unchecked Sendable` with
+        // hand-rolled `NSLock` discipline, which is a claim the suite should be
+        // able to fail rather than one it merely states. Eight threads actually
+        // contend here — a "concurrency test" with a single writer proves
+        // nothing about a lock.
+        let ledger = AllocationLedger()
+        let pool = FramePool(bufferCapacity: 64, retentionLimit: 4, ledger: ledger)
+        let threads = 8
+        let perThread = 250
+
+        DispatchQueue.concurrentPerform(iterations: threads) { _ in
+            for _ in 0..<perThread {
+                do {
+                    var frame = try pool.acquire()
+                    try frame.write([1, 2, 3, 4], ledger: nil)
+                    XCTAssertEqual(frame.count, 4)
+                } catch {
+                    XCTFail("unlimited pool must not refuse: \(error)")
+                }
+            }
+        }
+
+        // Every checkout is either a fresh allocation or a reuse, never both and
+        // never neither — so this total is exact, not a bound.
+        XCTAssertEqual(pool.allocationCount + pool.reuseCount, threads * perThread)
+        XCTAssertEqual(pool.liveCount, 0, "every frame's deinit ran")
+        XCTAssertEqual(pool.allocationCount, ledger.stats.allocationCount,
+                       "pool and ledger disagree after contention")
+        XCTAssertEqual(pool.reuseCount, ledger.stats.reuseCount)
+        XCTAssertLessThanOrEqual(pool.allocationCount, threads,
+                                 "contention should not allocate more than one buffer per thread")
+        pool.drain()
+        XCTAssertTrue(ledger.stats.isBalanced, "concurrent run leaked")
+    }
 
     /// `XCTAssertThrowsError` is generic over a `Copyable` result, and
     /// `acquire()` returns a `~Copyable` `FrameStore` — so it does not type-check

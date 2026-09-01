@@ -135,8 +135,23 @@ public enum FeedKernels {
 
     /// Averages adjacent tile pairs from `source` into `destination`.
     ///
-    /// `destination` must hold `((tileCount + 1) / 2) * dimension` elements. An
+    /// `destination` should hold `((tileCount + 1) / 2) * dimension` elements. An
     /// odd final tile is copied through unchanged.
+    ///
+    /// ## Totality
+    ///
+    /// `tileCount` and `dimension` arrive from a caller, not from a validated
+    /// `FeedGeometry`, so this function treats them as hostile. Every index is
+    /// computed with saturating arithmetic and then bounds-checked against the
+    /// *real* buffer lengths:
+    ///
+    /// - `(tileCount + 1)` overflows at `Int.max`, which the `>= 1` guard does
+    ///   not exclude — so the halving goes through ``Saturating``.
+    /// - The per-tile offsets `tile * dimension` overflow for large-but-legal
+    ///   `Int` arguments.
+    /// - The inner loop is bounded by the destination's remaining length rather
+    ///   than by `dimension`, so an absurd `dimension` truncates instead of
+    ///   spinning.
     ///
     /// - Returns: the number of elements written.
     @discardableResult
@@ -146,25 +161,36 @@ public enum FeedKernels {
         tileCount: Int,
         dimension: Int
     ) -> Int {
-        guard tileCount >= 1, dimension >= 1 else { return 0 }
-        let outputTiles = (tileCount + 1) / 2
+        guard tileCount >= 1, dimension >= 1, destination.count > 0 else { return 0 }
+        let outputTiles = Saturating.divide(Saturating.add(tileCount, 1), by: 2, fallback: 0)
         var written = 0
         for outputTile in 0..<outputTiles {
-            let firstTile = outputTile * 2
-            let secondTile = firstTile + 1
-            let firstBase = firstTile * dimension
-            let secondBase = secondTile * dimension
+            let outBase = Saturating.multiply(outputTile, dimension)
+            // The destination is the real limit on how much work exists. Once
+            // it is full there is nothing left to write, however many tiles the
+            // caller's geometry claims.
+            guard outBase < destination.count else { break }
+            let firstTile = Saturating.multiply(outputTile, 2)
+            let secondTile = Saturating.add(firstTile, 1)
+            let firstBase = Saturating.multiply(firstTile, dimension)
+            let secondBase = Saturating.multiply(secondTile, dimension)
             let hasSecond = secondTile < tileCount
-            for component in 0..<dimension {
-                let outIndex = outputTile * dimension + component
-                let firstIndex = firstBase + component
-                // Every index is bounds-checked against the real buffer length
-                // rather than trusted from the geometry, so a mismatched
-                // geometry truncates instead of reading out of bounds.
-                guard outIndex < destination.count, firstIndex < source.count else { continue }
+            let width = min(dimension, destination.count - outBase)
+            for component in 0..<width {
+                let outIndex = outBase + component
+                let firstIndex = Saturating.add(firstBase, component)
+                guard firstIndex < source.count else {
+                    // The geometry promised a tile the source does not contain.
+                    // Zero it rather than leaving whatever the recycled pool
+                    // buffer happened to hold from a previous frame.
+                    destination[outIndex] = 0
+                    written = Saturating.add(written, 1)
+                    continue
+                }
                 let first = Int(source[firstIndex])
-                if hasSecond, secondBase + component < source.count {
-                    let second = Int(source[secondBase + component])
+                let secondIndex = Saturating.add(secondBase, component)
+                if hasSecond, secondIndex < source.count {
+                    let second = Int(source[secondIndex])
                     // Round-half-away-from-zero so the fold is symmetric about 0
                     // and does not bias a centered tile negative.
                     let total = Saturating.add(first, second)
@@ -175,7 +201,7 @@ public enum FeedKernels {
                 } else {
                     destination[outIndex] = Saturating.clampToInt8(first)
                 }
-                written += 1
+                written = Saturating.add(written, 1)
             }
         }
         return written

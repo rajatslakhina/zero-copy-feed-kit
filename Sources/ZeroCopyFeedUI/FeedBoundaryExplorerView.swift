@@ -24,9 +24,10 @@ public struct ExplorerDefaults: Sendable, Equatable {
 
 /// Runs the same feed through both boundary shapes and shows what each one cost.
 ///
-/// The screen recomputes on every slider change and on appear, so the default
+/// The screen recomputes on appear and when a slider drag *ends*, so the default
 /// state already shows a real result rather than an empty placeholder waiting
-/// for a button press.
+/// for a button press — without starting a 200-frame run on every rendered
+/// frame of a drag.
 public struct FeedBoundaryExplorerView: View {
 
     @State private var tileCount: Double
@@ -117,8 +118,11 @@ public struct FeedBoundaryExplorerView: View {
     private func matchBadge(_ comparison: BoundaryComparison) -> some View {
         HStack(spacing: 8) {
             Image(systemName: comparison.outputsMatch ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+            // "Same digest" rather than "byte-identical": the check that ran is
+            // an FNV-1a/64 comparison, and the badge should claim what it
+            // actually verified.
             Text(comparison.outputsMatch
-                 ? "Both boundaries produced byte-identical output"
+                 ? "Both boundaries produced the same output digest"
                  : "Outputs diverged — comparison invalid")
                 .font(.subheadline.weight(.medium))
         }

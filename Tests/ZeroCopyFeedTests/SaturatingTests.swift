@@ -95,11 +95,15 @@ final class SaturatingTests: XCTestCase {
 
     // MARK: - Ceiling
 
-    func testMaximumElementCountIsDerivedFromIntMax() {
-        // Written as `Int.max / 4`, not as a 64-bit literal, so it shrinks
-        // correctly where `Int` is 32 bits.
-        XCTAssertEqual(Saturating.maximumElementCount, Int.max / 4)
-        XCTAssertGreaterThan(Saturating.maximumElementCount, 0)
-        XCTAssertLessThan(Saturating.maximumElementCount, Int.max)
+    func testMaximumElementCountIsTheSmallerOfTwoBounds() {
+        // Two bounds: an overflow bound derived from `Int.max` (so it shrinks
+        // where `Int` is 32 bits) and a 256 MiB allocation bound (because
+        // `allocate` aborts uncatchably rather than throwing). The smaller wins.
+        //
+        // Both halves are asserted, not just the answer: a change to either
+        // bound turns this red, which a bare `> 0` check would not.
+        XCTAssertEqual(Saturating.maximumElementCount, min(Int.max / 4, 256 * 1024 * 1024))
+        XCTAssertLessThanOrEqual(Saturating.maximumElementCount, Int.max / 4)
+        XCTAssertLessThanOrEqual(Saturating.maximumElementCount, 256 * 1024 * 1024)
     }
 }

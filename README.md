@@ -15,6 +15,8 @@ The result, from the test suite, not from prose:
 
 Two allocations, not forty, not one hundred and twenty — and **the number does not change when you process 200 frames instead of 20.**
 
+Two things this table is *not* claiming, stated up front rather than in a footnote. It excludes the per-frame synthetic capture buffer, which both paths allocate identically (one `[Int8]` per frame, 20 each here) — symmetric, so it cancels, but it means the absolute totals are ~22 vs ~140 rather than 2 vs 120. And nothing here runs a model: the payload is deterministic SplitMix64 noise and the kernels are integer requantize / mean-removal / gate / fold. This is the *plumbing* an on-device inference feed needs, sized and shaped like the real thing, not an inference engine.
+
 ---
 
 ## Why this matters
@@ -81,11 +83,15 @@ And the trade runs in both directions, which is the part usually left out:
 
 ## Relationship to SE-0507 and `Iterable`
 
-Swift 6.4 adds `borrow` and `mutate` accessors, which express "hand out a view of the storage, do not copy it" as a *property* rather than as a closure, without the allocation-plus-two-calls overhead of a `_read`/`_modify` coroutine — and `Iterable` hands a `for` loop a span of elements to borrow in batches.
+**SE-0507** (`borrow` / `mutate` accessors) is *Implemented (Swift 6.4)*. It expresses "hand out a view of the storage, do not copy it" as a **property** rather than a closure, without the allocation-plus-two-calls overhead of a `_read`/`_modify` coroutine.
+
+**SE-0516** (`Iterable`, which hands a `for` loop a span of elements to borrow in batches) is *Accepted* — not in a shipped release. Worth keeping straight, since attributing an unshipped proposal to 6.4 is exactly the kind of overclaim this section exists to avoid.
 
 This package targets **Swift 6.0**, so the same semantics are spelled with scoped closures (`withBytes`, `withMutableInt8`, `TileWalk.forEachTile`). The borrowing *contract* is identical: the closure sees the storage in place, and the buffer pointer must not escape it.
 
-This is stated plainly rather than papered over: **the code here does not use SE-0507's accessors, because the toolchain it is verified against does not have them.** What 6.4 changes is ergonomics and call overhead. What it does not change is which boundary shapes preserve zero copies — and that is the entire argument. When the accessors land, `withMutableInt8 { }` becomes a `mutate` property and `TileWalk.forEachTile` becomes a `for` loop; the allocation table above stays exactly the same.
+Stated plainly rather than papered over: **the code here does not use SE-0507's accessors, because the toolchain it is verified against does not have them** — and adopting them later would not be a mechanical rename either. `FrameStore`'s storage is a raw pointer, and SE-0507 lists *borrowing via unsafe pointers* under **future directions**: a `borrow` accessor may only return a stored property, or a computed one that itself has a `borrow` accessor. This type is precisely the case the proposal defers.
+
+What 6.4 changes is ergonomics and call overhead. What it does not change is which boundary shapes preserve zero copies — and that is the entire argument. The allocation table above is a property of the signatures, not of the toolchain.
 
 ---
 
@@ -98,22 +104,68 @@ A feed path takes user-controlled geometry and quantized data that reaches `Int8
 - `abs(Int8.min)` — traps, because 128 is not representable in `Int8`. `Saturating.magnitude(ofInt8:)` widens first. A quantized feed hits `-128` constantly; this is not a theoretical case.
 - `a * b` overflow, `Int8(300)` — clamped, not trapped.
 
-Beyond arithmetic: every collection access is bounds-checked against the *real* buffer length rather than trusted from the geometry, so a mismatched geometry truncates instead of reading out of bounds; zero-length frames, `dimension = 0`, negative counts, and ragged final tiles are all covered by tests; and the pool's live limit turns "the feed ran ahead of the consumer" into a thrown `FeedError.poolExhausted` rather than unbounded growth.
+The kernels take `tileCount` and `dimension` straight from a caller rather than from a validated `FeedGeometry`, so they treat both as hostile: index math goes through `Saturating` (`tileCount + 1` overflows at `Int.max`; `tile * dimension` overflows well before that), and the loops are bounded by the *destination's* real length rather than by the claimed geometry, so an absurd `dimension` truncates instead of spinning. Every collection access is bounds-checked against the real buffer length; a tile the geometry promises but the source does not contain is zeroed rather than left holding a recycled buffer's previous frame. Zero-length frames, `dimension = 0`, negative counts, ragged final tiles and `Int.max` geometries are all covered by tests.
 
-There are exactly two force-unwrap-shaped constructs in the package, both `if let` guards on `baseAddress` after a `count > 0` check, both commented with why they are provably safe.
+Two ceilings rather than one: `Saturating.maximumElementCount` is the *smaller* of an overflow bound (`Int.max / 4`, derived so it shrinks on 32-bit) and a 256 MiB allocation bound — because `UnsafeMutableRawPointer.allocate` aborts uncatchably on failure, so validating only for overflow would turn a throwable error into a crash. And the pool's live limit turns "the feed ran ahead of the consumer" into a thrown `FeedError.poolExhausted` rather than unbounded growth.
+
+There are exactly three force-unwrap-shaped constructs in the package — `FrameStore.write`, `TileWalk.forEachTile` and `TileWalk.forEachMutableTile` — all `if let` guards on `baseAddress` after a `count > 0` check, all three commented with why they are provably safe.
+
+---
+
+## Installation
+
+```swift
+// Package.swift
+.package(url: "https://github.com/rajatslakhina/zero-copy-feed-kit.git", from: "1.0.0")
+```
+
+```swift
+.target(name: "YourFeature", dependencies: [
+    .product(name: "ZeroCopyFeed", package: "zero-copy-feed-kit"),
+    .product(name: "ZeroCopyFeedUI", package: "zero-copy-feed-kit"),  // SwiftUI explorer, optional
+])
+```
+
+In Xcode: **File → Add Package Dependencies…**, paste the URL, choose *Up to Next Major Version* from `1.0.0`.
+
+## Running it yourself
+
+```bash
+git clone https://github.com/rajatslakhina/zero-copy-feed-kit.git
+cd zero-copy-feed-kit
+swift build -Xswiftc -warnings-as-errors
+swift test
+```
+
+Reproducing the table at the top:
+
+```swift
+import ZeroCopyFeed
+
+let comparison = try BoundaryBenchmark.compare(
+    tileCount: 32, dimension: 64, frameCount: 20, stageCount: 6
+)
+print(comparison.outputsMatch)                      // true
+print(comparison.owning.stats.allocationCount)      // 2
+print(comparison.value.stats.allocationCount)       // 120
+print(comparison.headline)
+// 20 frames · 6 stages · 2 vs 120 allocations (60.0×)
+```
+
+`ZeroCopyFeedUI` compiles to nothing where SwiftUI is unavailable, so the package builds and tests cleanly on Linux.
 
 ---
 
 ## Verification
 
-- **68 tests, 0 failures** on Swift 6.0.3 (Linux, aarch64), from a clean `rm -rf .build` followed by `swift build -Xswiftc -warnings-as-errors` and `swift test`.
-- The `-warnings-as-errors` flag lives in the CI job, not in this README, so "zero warnings" is machine-enforced rather than asserted.
-- CI runs two jobs on every push — a Linux job that does the clean warnings-as-errors build and the full test run, and a `macos-15` job that compiles the package for `generic/platform=iOS Simulator`. Current status is on the [Actions tab](../../actions).
-- **A Simulator run was attempted and could not be performed** — see the demo repo's README for exactly what happened and what was verified instead. "It compiles for a Simulator" and "it ran on a Simulator" are different claims and are reported separately.
+- **72 tests, 0 failures** on Swift 6.0.3 (Linux, aarch64), from a clean `rm -rf .build` followed by `swift build -Xswiftc -warnings-as-errors` and `swift test`.
+- CI runs two jobs on every push — a Linux job that repeats that clean warnings-as-errors build and the full test run, and a `macos-15` job that compiles the package for `generic/platform=iOS Simulator`. Status is on the [Actions tab](../../actions).
+- Scope of the warnings claim, precisely: `-warnings-as-errors` is applied by the Linux job, which compiles the core module. `ZeroCopyFeedUI` is entirely inside `#if canImport(SwiftUI)` and so is only *compiled* by the macOS job, which does not pass the flag — deliberately, because supporting iOS 16 means using APIs (`foregroundColor`) that are soft-deprecated on the iOS 17+ SDK. So "zero warnings, machine-enforced" is true of the core module and is not claimed of the SwiftUI layer.
+- **A Simulator run was attempted and could not be performed** — see the demo repo's README for the verbatim refusal and what was verified instead. "It compiles for a Simulator" and "it ran on a Simulator" are different claims and are reported separately.
 
 ## Demo app
 
-Demo app: **(added after the companion repo is pushed — see below)**
+**[zero-copy-feed-kit-demo-app](https://github.com/rajatslakhina/zero-copy-feed-kit-demo-app)** — an iOS app that consumes this package as a remote, version-pinned dependency and puts the comparison on screen with live sliders.
 
 ## Requirements
 

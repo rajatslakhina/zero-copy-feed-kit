@@ -109,8 +109,14 @@ public struct BoundaryComparison: Sendable, Equatable {
         self.value = value
     }
 
-    /// True when both boundaries produced byte-identical output for every
-    /// frame.
+    /// True when both boundaries produced the same output **digest** for every
+    /// frame, over the same geometry and the same frame count.
+    ///
+    /// Stated as "digest" rather than "byte-identical" because that is what was
+    /// compared: a 64-bit FNV-1a fold, chosen so neither path has to materialise
+    /// an array inside the measured region. For a byte-level comparison, call
+    /// `FrameStore.snapshot()` outside the measured region — `FrameStoreTests`
+    /// does exactly that.
     ///
     /// This is the load-bearing check. Without it the allocation numbers below
     /// are meaningless, because a path that skips work allocates less for

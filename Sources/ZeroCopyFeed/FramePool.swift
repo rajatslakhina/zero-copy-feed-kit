@@ -139,7 +139,13 @@ public final class FramePool: @unchecked Sendable {
         )
         // Raw memory is uninitialised; frames only ever read bytes they have
         // written, but zeroing removes any dependence on that being true.
-        pointer.initializeMemory(as: UInt8.self, repeating: 0, count: bufferCapacity)
+        //
+        // Bound as `Int8`, deliberately: `FrameStore` reaches this memory through
+        // `assumingMemoryBound(to: Int8.self)`, which *asserts* the memory is
+        // already bound to that type. Initialising it as `UInt8` here and then
+        // assuming `Int8` there would be benign on every real target and still
+        // formally undefined.
+        pointer.initializeMemory(as: Int8.self, repeating: 0, count: bufferCapacity)
         ledger.recordAllocation(bytes: bufferCapacity)
         return pointer
     }

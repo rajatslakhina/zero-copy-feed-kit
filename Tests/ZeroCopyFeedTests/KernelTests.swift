@@ -156,6 +156,39 @@ final class KernelTests: XCTestCase {
     func testFoldPairsWithDegenerateGeometryWritesNothing() {
         XCTAssertEqual(folding([1, 2], tileCount: 0, dimension: 2, destinationCount: 2).1, 0)
         XCTAssertEqual(folding([1, 2], tileCount: 2, dimension: 0, destinationCount: 2).1, 0)
+        XCTAssertEqual(folding([1, 2], tileCount: 2, dimension: 2, destinationCount: 0).1, 0)
+    }
+
+    func testFoldPairsSurvivesAnAbsurdGeometry() {
+        // `(tileCount + 1) / 2` overflows at `Int.max`, and the per-tile offsets
+        // `tile * dimension` overflow well before that. All of these used to
+        // trap; the destination's length is now the real bound on the work.
+        let (a, writtenA) = folding([1, 2, 3, 4], tileCount: Int.max, dimension: 1, destinationCount: 2)
+        XCTAssertEqual(writtenA, 2)
+        XCTAssertEqual(a.count, 2)
+
+        let (_, writtenB) = folding([1, 2, 3, 4], tileCount: 2, dimension: Int.max, destinationCount: 2)
+        XCTAssertEqual(writtenB, 2, "an absurd dimension truncates to the destination rather than spinning")
+
+        let (_, writtenC) = folding([1, 2], tileCount: Int.max, dimension: Int.max, destinationCount: 1)
+        XCTAssertEqual(writtenC, 1)
+    }
+
+    func testFoldPairsZeroesRatherThanLeavingStaleBytes() {
+        // The geometry claims four tiles; the source only has one. On a recycled
+        // pool buffer, skipping the write would surface a previous frame's bytes.
+        var destination: [Int8] = [99, 99, 99, 99]
+        var written = 0
+        let source: [Int8] = [7, 7]
+        source.withUnsafeBufferPointer { input in
+            destination.withUnsafeMutableBufferPointer { output in
+                written = FeedKernels.foldPairs(
+                    source: input, destination: output, tileCount: 4, dimension: 2
+                )
+            }
+        }
+        XCTAssertEqual(written, 4)
+        XCTAssertEqual(destination, [7, 7, 0, 0], "absent source tiles are zeroed, not left stale")
     }
 
     // MARK: - Synthetic source
