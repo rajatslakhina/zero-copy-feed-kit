@@ -12,6 +12,71 @@ final class BoundaryComparisonTests: XCTestCase {
     private let dimension = 64
     private let bytesPerFrame = 2048
 
+    // MARK: - The equality gate itself
+
+    /// `outputsMatch` checks three things, and a review found only one of them
+    /// covered: deleting the `finalGeometry` and `framesProcessed` arms left the
+    /// whole suite green. A gate with untested arms is a gate that can quietly
+    /// stop gating.
+    func testOutputsMatchRejectsAgreementOnDigestAlone() throws {
+        let geometry = try FeedGeometry(tileCount: 16, dimension: 32)
+        let configuration = try FeedRunConfiguration(geometry: geometry, frameCount: 4, stageCount: 6)
+
+        let owning = try OwningPipeline.run(configuration: configuration, ledger: AllocationLedger())
+        let consuming = try ConsumingValuePipeline.run(
+            configuration: configuration, ledger: AllocationLedger()
+        )
+        let value = try ValuePipeline.run(configuration: configuration, ledger: AllocationLedger())
+
+        XCTAssertTrue(
+            BoundaryComparison(
+                configuration: configuration, owning: owning,
+                consumingValue: consuming, value: value
+            ).outputsMatch,
+            "baseline must agree or neither control below proves anything"
+        )
+
+        // Same digest, wrong output geometry. A path that ends up claiming a
+        // different shape has not done the same work, whatever the fold says.
+        let wrongGeometry = BoundaryRunResult(
+            shape: value.shape,
+            stats: value.stats,
+            poolAllocationCount: nil,
+            poolReuseCount: nil,
+            peakLiveFrames: nil,
+            combinedDigest: owning.combinedDigest,
+            framesProcessed: owning.framesProcessed,
+            finalGeometry: try FeedGeometry(tileCount: 3, dimension: 5)
+        )
+        XCTAssertFalse(
+            BoundaryComparison(
+                configuration: configuration, owning: owning,
+                consumingValue: consuming, value: wrongGeometry
+            ).outputsMatch,
+            "a matching digest over a different geometry must not pass the gate"
+        )
+
+        // Same digest, fewer frames. This is the cheapest way to fake a low
+        // allocation count, so it is the one the gate most needs to catch.
+        let wrongFrames = BoundaryRunResult(
+            shape: consuming.shape,
+            stats: consuming.stats,
+            poolAllocationCount: nil,
+            poolReuseCount: nil,
+            peakLiveFrames: nil,
+            combinedDigest: owning.combinedDigest,
+            framesProcessed: owning.framesProcessed - 1,
+            finalGeometry: owning.finalGeometry
+        )
+        XCTAssertFalse(
+            BoundaryComparison(
+                configuration: configuration, owning: owning,
+                consumingValue: wrongFrames, value: value
+            ).outputsMatch,
+            "a path that processed fewer frames must not pass the gate"
+        )
+    }
+
     // MARK: - The headline configuration
 
     func testSixStageRunAllocatesTwoBuffersRegardlessOfFrameCount() throws {
