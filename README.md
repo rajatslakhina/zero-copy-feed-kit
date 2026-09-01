@@ -13,7 +13,24 @@ This package makes that decision measurable: the same quantized embedding tiles,
 
 Two allocations, not twenty, not one hundred and twenty — and **only the first column stays at 2 when you process 200 frames instead of 20.**
 
-Two things this table is *not* claiming. It excludes the per-frame synthetic capture buffer, which every path allocates identically (one `[Int8]` per frame) — symmetric, so it cancels, but the absolute totals are ~22 / ~40 / ~140 rather than 2 / 20 / 120. And nothing here runs a model: the payload is deterministic SplitMix64 noise and the kernels are integer requantize / mean-removal / gate / fold. This is the *plumbing* an on-device inference feed needs, sized and shaped like the real thing, not an inference engine.
+### The build mode this is true in
+
+**The middle column is a release-mode result, and that qualifier is load-bearing.** `consuming` is a guarantee about *ownership*, not an instruction to the code generator: it makes the array provably uniquely referenced at the mutation, and the ARC optimiser is what then deletes the retain that would otherwise make copy-on-write fire. At `-Onone` that optimiser does not run.
+
+Counting every real `malloc` with an `LD_PRELOAD` interposer, on this exact configuration:
+
+| | owning | consuming | borrowing |
+|---|---:|---:|---:|
+| `-O` | 27 | **45** | 145 |
+| `-Onone` | 171 | **20,783** | 20,765 |
+
+In a debug build the consuming and borrowing paths are, to within the interposer's own noise, **the same program**. The ledger still reports 2 / 20 / 120 in both, and it is not lying: it counts the allocations the *library* asks for, and a copy-on-write copy is one the runtime makes on the library's behalf. So the saving is real, and it is real at `-O`.
+
+Rather than leave that as a footnote, `swift test -c release` is part of CI and `testConsumingStagesMutateTheirInputBufferInPlace` asserts buffer identity there — it skips itself in a debug build with that reason, instead of asserting something false. Gut all three in-place stages into deep copies and that test goes red; that is how I know it is worth having.
+
+(Raw `malloc` totals include Swift runtime and test-harness overhead and will not reproduce to the digit on a different machine. The ledger numbers — 2 / 20 / 120 — are exact, deterministic, and asserted by the suite.)
+
+Two more things this table is *not* claiming. It excludes the per-frame synthetic capture buffer, which every path allocates identically (one `[Int8]` per frame) — symmetric, so it cancels, and it is most of the gap between the ledger's 2 / 20 / 120 and the `-O` row above. And nothing here runs a model: the payload is deterministic SplitMix64 noise and the kernels are integer requantize / mean-removal / gate / fold. This is the *plumbing* an on-device inference feed needs, sized and shaped like the real thing, not an inference engine.
 
 ---
 
@@ -153,7 +170,10 @@ git clone https://github.com/rajatslakhina/zero-copy-feed-kit.git
 cd zero-copy-feed-kit
 swift build -Xswiftc -warnings-as-errors
 swift test
+swift test -c release   # reaches the copy-elision assertion, which debug skips
 ```
+
+The release run is not optional decoration. `testConsumingStagesMutateTheirInputBufferInPlace` asserts that a consuming stage hands back the *same* buffer it was given, which is only true once the ARC optimiser has run; in a debug build it skips itself with that reason rather than asserting something false.
 
 Reproducing the table at the top:
 
@@ -177,8 +197,8 @@ print(comparison.headline)
 
 ## Verification
 
-- **79 tests, 0 failures** on Swift 6.0.3 (Linux, aarch64), from a clean `rm -rf .build` followed by `swift build -Xswiftc -warnings-as-errors` and `swift test`.
-- CI runs two jobs on every push to `main` (and on pull requests into it) — a Linux job that repeats that clean warnings-as-errors build and the full test run, and a `macos-15` job that compiles the package for `generic/platform=iOS Simulator`. Status is on the [Actions tab](../../actions).
+- **82 tests, 0 failures** on Swift 6.0.3 (Linux, aarch64), from a clean `rm -rf .build` followed by `swift build -Xswiftc -warnings-as-errors` and `swift test`. One of them skips in a debug build, on purpose, and asserts under `swift test -c release`; the exact counts are in the CI log rather than restated here, because a hand-copied number goes stale the next time someone adds a test.
+- CI runs two jobs on every push to `main` (and on pull requests into it) — a Linux job that repeats that clean warnings-as-errors build and runs the suite in **both** debug and release, and a `macos-15` job that compiles the package for `generic/platform=iOS Simulator`. Status is on the [Actions tab](../../actions).
 - Scope of the warnings claim, precisely: `-warnings-as-errors` is applied by the Linux job, which compiles the core module. `ZeroCopyFeedUI` is entirely inside `#if canImport(SwiftUI)` and so is only *compiled* by the macOS job, which does not pass the flag — deliberately, because supporting iOS 16 means using APIs (`foregroundColor`) that are soft-deprecated on the iOS 17+ SDK. So "zero warnings, machine-enforced" is true of the core module and is not claimed of the SwiftUI layer.
 - **A Simulator run was attempted and could not be performed** — see the demo repo's README for the verbatim refusal and what was verified instead. "It compiles for a Simulator" and "it ran on a Simulator" are different claims and are reported separately.
 
