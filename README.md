@@ -151,7 +151,7 @@ There are exactly three force-unwrap-shaped constructs in the package — `Frame
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/rajatslakhina/zero-copy-feed-kit.git", from: "1.1.0")
+.package(url: "https://github.com/rajatslakhina/zero-copy-feed-kit.git", from: "1.1.1")
 ```
 
 ```swift
@@ -161,7 +161,7 @@ There are exactly three force-unwrap-shaped constructs in the package — `Frame
 ])
 ```
 
-In Xcode: **File → Add Package Dependencies…**, paste the URL, choose *Up to Next Major Version* from `1.1.0`.
+In Xcode: **File → Add Package Dependencies…**, paste the URL, choose *Up to Next Major Version* from `1.1.1`.
 
 ## Running it yourself
 
