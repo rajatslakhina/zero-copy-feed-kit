@@ -3,4 +3,8 @@
 .swiftpm/
 Package.resolved
 xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
 DerivedData/
+*.hmap
+*.ipa
+*.dSYM.zip
