@@ -48,6 +48,14 @@ public final class FramePool: @unchecked Sendable {
     ///     argument into a crash. `FeedGeometry` enforces the same ceiling, but
     ///     a caller can construct a pool without ever going through it — so the
     ///     bound has to live at the site that actually allocates.
+    ///
+    ///     Being precise about what this buys: it removes the *unbounded*
+    ///     request, not every failure. `acquire()` is still not total — a 256
+    ///     MiB allocation under real memory pressure aborts the same way, and
+    ///     `allocate` gives no way to find out except by not coming back.
+    ///     Making it total would mean `posix_memalign` and a thrown error;
+    ///     that is a deliberate non-goal here, and this note exists so the
+    ///     clamp is not read as a stronger guarantee than it is.
     ///   - retentionLimit: Free-list size. Clamped to at least zero.
     ///   - liveLimit: Optional checkout ceiling for backpressure.
     ///   - ledger: The instrument that records this pool's allocations.
