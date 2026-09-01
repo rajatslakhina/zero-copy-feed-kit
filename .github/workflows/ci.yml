@@ -30,6 +30,15 @@ jobs:
       - name: Test
         run: swift test
 
+      # The consuming boundary's copy-elision is a release-mode property:
+      # `consuming` proves unique ownership, and the ARC optimiser is what then
+      # removes the retain that would make copy-on-write fire. At `-Onone` it
+      # does not run. `testConsumingStagesMutateTheirInputBufferInPlace` skips
+      # itself in a debug build and asserts here, so this job is what turns
+      # "does not copy" from prose into a check that can go red.
+      - name: Test (release — reaches the copy-elision assertions)
+        run: swift test -c release
+
   ios:
     name: iOS Simulator · compile
     runs-on: macos-15
