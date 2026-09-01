@@ -39,6 +39,26 @@ import Foundation
 ///
 /// `ZeroCopyFeed` ships all three so the comparison is against the best
 /// alternative rather than the most convenient one.
+///
+/// ## The build mode this is true in
+///
+/// **These numbers describe an optimised build.** `consuming` is a semantic
+/// guarantee about ownership, not an instruction to the code generator: it
+/// makes the array *provably* uniquely referenced at the mutation, and the ARC
+/// optimiser is what then removes the retain that would otherwise make
+/// copy-on-write fire. At `-Onone` that optimiser does not run, the retain
+/// survives, and the consuming path allocates on every stage exactly like the
+/// borrowing one — measured, in a debug build of this package, at the same
+/// 20,750 `malloc` calls for both.
+///
+/// The ledger cannot see that difference, because it counts the allocations the
+/// *library* asks for and this one is a copy-on-write copy the runtime makes on
+/// the library's behalf. So the table above is a release-mode measurement, and
+/// `swift test -c release` is what enforces it — the CI job runs both.
+///
+/// This is stated rather than buried because the package's own documentation
+/// says the ledger reports "numbers that came out of here", and here is a case
+/// where the ledger's number and the machine's number agree only at `-O`.
 public protocol ConsumingValueFeedStage: Sendable {
 
     var kind: FeedStageKind { get }
@@ -68,9 +88,12 @@ public struct ConsumingRequantizeStage: ConsumingValueFeedStage {
     public func transform(
         _ input: consuming FrameValue, geometry: FeedGeometry, ledger: AllocationLedger?
     ) -> FrameValue {
-        // `input` is consumed, so this is the array's last reference and the
-        // mutation below is in place. No `recordAllocation` here — because none
-        // happens, which is the whole point of the type.
+        // `input` is consumed, so this is the array's last reference: the
+        // mutation below is semantically in place and the library asks for no
+        // allocation, which is the whole point of the type. In an optimised
+        // build no allocation happens at all. At `-Onone` the ARC optimiser
+        // does not run, the extra retain survives, and copy-on-write fires
+        // anyway — see the note on `ConsumingValueFeedStage`.
         var output = input.bytes
         output.withUnsafeMutableBufferPointer { buffer in
             FeedKernels.requantize(buffer, numerator: numerator, denominator: denominator)
@@ -202,13 +225,21 @@ public enum ConsumingValuePipeline {
 
             for stage in stages {
                 let produced = stage.transform(consume value, geometry: geometry, ledger: ledger)
-                // Only the fold allocates here, so only the fold's predecessor
-                // has a buffer to release. An in-place stage hands the same
-                // storage straight back.
-                if let previous = chargedBytes, produced.count != previous {
-                    ledger.recordDeallocation(bytes: previous)
-                }
+                // Only the fold allocates, so only the fold replaces the buffer
+                // that is currently charged — an in-place stage hands the same
+                // storage straight back and nothing is released.
+                //
+                // Release is keyed on "a new allocation replaced it", not on
+                // "the output size changed". Those look equivalent and are not:
+                // two folds in a row produce the same size whenever
+                // `tileCount == 1`, because `(1 + 1) / 2 == 1`. Keying on size
+                // dropped the release in that case and made `isBalanced` report
+                // a leak that did not exist, through the public `stages:`
+                // injection point.
                 if stage.kind == .foldPairs {
+                    if let previous = chargedBytes {
+                        ledger.recordDeallocation(bytes: previous)
+                    }
                     chargedBytes = produced.count
                 }
                 value = produced
