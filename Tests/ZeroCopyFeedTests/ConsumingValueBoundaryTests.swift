@@ -11,21 +11,133 @@ import XCTest
 /// no size-changing stage it allocates **nothing at all**.
 final class ConsumingValueBoundaryTests: XCTestCase {
 
-    func testConsumingAvoidsCopyOnWriteEntirelyWhenNoStageChangesSize() throws {
-        // Stages 1-3 of the ladder are all in-place. With `consuming`, the array
-        // is uniquely referenced at the point of mutation, so copy-on-write never
-        // fires and the whole run is allocation-free.
+    /// A consuming stage that deep-copies instead of mutating in place — the
+    /// exact opposite of the property this file exists to demonstrate.
+    private struct CopyingConsumingGateStage: ConsumingValueFeedStage {
+        let kind: FeedStageKind = .gateWeak
+
+        func transform(
+            _ input: consuming FrameValue, geometry: FeedGeometry, ledger: AllocationLedger?
+        ) -> FrameValue {
+            var output = [Int8](repeating: 0, count: input.bytes.count)
+            ledger?.recordAllocation(bytes: output.count)
+            for i in 0..<output.count { output[i] = input.bytes[i] }
+            output.withUnsafeMutableBufferPointer { FeedKernels.gate($0, belowMagnitude: 4) }
+            return FrameValue(bytes: output)
+        }
+    }
+
+    private func baseAddress(of value: FrameValue) -> UInt {
+        value.bytes.withUnsafeBufferPointer { UInt(bitPattern: $0.baseAddress) }
+    }
+
+    /// The real proof, and the one the ledger cannot give.
+    ///
+    /// An earlier version of this file asserted `allocationCount == 0` for a
+    /// three-stage run. That assertion was **vacuous**: no in-place consuming
+    /// stage calls `recordAllocation`, so `0 == 0` held for every possible
+    /// implementation — including one that deep-copies on every stage. Replacing
+    /// all three in-place stages with copying ones left the whole suite green.
+    ///
+    /// Buffer identity is the property that actually distinguishes them, so test
+    /// that. It is also build-dependent: `consuming` guarantees unique ownership,
+    /// but the ARC optimiser is what removes the retain that would make
+    /// copy-on-write fire, and that optimiser does not run at `-Onone`. Asserting
+    /// it in a debug build would be asserting something false, so the assertion
+    /// is release-only and CI runs `swift test -c release` to reach it.
+    func testConsumingStagesMutateTheirInputBufferInPlace() throws {
+        #if DEBUG
+        throw XCTSkip(
+            "copy-on-write elision needs the ARC optimiser; this is a release-mode property. "
+                + "Run `swift test -c release`."
+        )
+        #else
+        let geometry = try FeedGeometry(tileCount: 16, dimension: 32)
+        var value = FrameValue(bytes: FeedKernels.syntheticFrame(byteCount: geometry.byteCount, seed: 7))
+        let original = baseAddress(of: value)
+
+        for kind in [FeedStageKind.requantizeUp, .zeroCenter, .gateWeak] {
+            value = kind.makeConsumingValueStage()
+                .transform(consume value, geometry: geometry, ledger: nil)
+            XCTAssertEqual(
+                baseAddress(of: value), original,
+                "\(kind) reallocated instead of mutating in place"
+            )
+        }
+
+        // Negative control: the copying stage must move the buffer, or the check
+        // above is measuring nothing.
+        var copied = FrameValue(bytes: FeedKernels.syntheticFrame(byteCount: geometry.byteCount, seed: 7))
+        let beforeCopy = baseAddress(of: copied)
+        copied = CopyingConsumingGateStage()
+            .transform(consume copied, geometry: geometry, ledger: nil)
+        XCTAssertNotEqual(
+            baseAddress(of: copied), beforeCopy,
+            "the control did not reallocate, so the in-place assertions prove nothing"
+        )
+        #endif
+    }
+
+    func testALedgerZeroDoesNotByItselfProveAnythingAboutCopying() throws {
+        // Kept as documentation of the shape, and honest about its own weakness:
+        // this number is zero because no in-place stage charges the ledger, in
+        // every build and for every implementation. The assertion below is a
+        // change-detector for the wiring, not evidence of copy elision — the
+        // control that follows is what makes it worth anything.
         let comparison = try BoundaryBenchmark.compare(
             tileCount: 16, dimension: 32, frameCount: 5, stageCount: 3
         )
         XCTAssertTrue(comparison.outputsMatch)
-        XCTAssertEqual(
-            comparison.consumingValue.stats.allocationCount, 0,
-            "an erased value boundary CAN be allocation-free — this is the claim the "
-                + "two-way comparison used to get wrong"
-        )
+        XCTAssertEqual(comparison.consumingValue.stats.allocationCount, 0)
         XCTAssertEqual(comparison.value.stats.allocationCount, 15, "5 frames × 3 stages")
         XCTAssertEqual(comparison.owning.stats.allocationCount, 1)
+
+        // Substitute one copying stage through the public injection point: the
+        // ledger must now report it. If this passed at 0 too, the ledger would
+        // not be measuring the pipeline at all.
+        let geometry = try FeedGeometry(tileCount: 16, dimension: 32)
+        let configuration = try FeedRunConfiguration(geometry: geometry, frameCount: 5, stageCount: 3)
+        let ledger = AllocationLedger()
+        _ = try ConsumingValuePipeline.run(
+            configuration: configuration,
+            ledger: ledger,
+            stages: [
+                FeedStageKind.requantizeUp.makeConsumingValueStage(),
+                FeedStageKind.zeroCenter.makeConsumingValueStage(),
+                CopyingConsumingGateStage()
+            ]
+        )
+        XCTAssertEqual(ledger.stats.allocationCount, 5, "one copy per frame, and the ledger saw it")
+    }
+
+    func testRepeatedFoldsAtTheSameOutputSizeStayBalanced() throws {
+        // `(1 + 1) / 2 == 1`, so two folds at `tileCount == 1` produce the same
+        // size. An earlier version released the previous buffer only when the
+        // size changed, so this configuration allocated three times and released
+        // once and `isBalanced` reported a leak that was not there. Reachable
+        // only through the public `stages:` parameter, which is exactly why that
+        // parameter is public.
+        let geometry = try FeedGeometry(tileCount: 1, dimension: 64)
+        let configuration = try FeedRunConfiguration(geometry: geometry, frameCount: 3, stageCount: 0)
+
+        for kinds in [
+            [FeedStageKind.foldPairs, .foldPairs],
+            [.foldPairs, .foldPairs, .foldPairs],
+            [.foldPairs, .gateWeak, .foldPairs]
+        ] {
+            let ledger = AllocationLedger()
+            _ = try ConsumingValuePipeline.run(
+                configuration: configuration,
+                ledger: ledger,
+                stages: kinds.map { $0.makeConsumingValueStage() }
+            )
+            let stats = ledger.stats
+            let folds = kinds.filter { $0 == .foldPairs }.count
+            XCTAssertEqual(stats.allocationCount, folds * 3, "\(kinds): one per fold per frame")
+            XCTAssertEqual(stats.deallocationCount, stats.allocationCount, "\(kinds) leaked a charge")
+            XCTAssertEqual(stats.liveBytes, 0, "\(kinds)")
+            XCTAssertTrue(stats.isBalanced, "\(kinds)")
+        }
     }
 
     func testConsumingStillPaysOncePerFrameForTheSizeChangingStage() throws {
